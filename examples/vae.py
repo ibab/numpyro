@@ -13,10 +13,12 @@ import time
 
 import matplotlib.pyplot as plt
 
+import jax
 from jax import jit, lax, random
 from jax.experimental import stax
 import jax.numpy as np
 from jax.random import PRNGKey
+import haiku as hk
 
 import numpyro
 from numpyro import optim
@@ -29,26 +31,56 @@ RESULTS_DIR = os.path.abspath(os.path.join(os.path.dirname(inspect.getfile(lambd
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
-def encoder(hidden_dim, z_dim):
-    return stax.serial(
-        stax.Dense(hidden_dim, W_init=stax.randn()), stax.Softplus,
-        stax.FanOut(2),
-        stax.parallel(stax.Dense(z_dim, W_init=stax.randn()),
-                      stax.serial(stax.Dense(z_dim, W_init=stax.randn()), stax.Exp)),
-    )
+class Encoder(hk.Module):
+    def __init__(self, hidden_dim, z_dim):
+        super(Encoder, self).__init__()
+        self._hidden_dim = hidden_dim
+        self._z_dim = z_dim
+
+    def __call__(self, x):
+        x = hk.Linear(self._hidden_dim)(x)
+        x = jax.nn.softplus(x)
+        mu = hk.Linear(self._z_dim)(x)
+        # Using softplus rather than exp because it's more stable.
+        sigma = jax.nn.softplus(hk.Linear(self._z_dim)(x))
+        return mu, sigma
+
+class Decoder(hk.Module):
+
+    def __init__(self, hidden_dim, out_dim):
+        super(Decoder, self).__init__()
+        self._hidden_dim = hidden_dim
+        self._out_dim = out_dim
+
+    def __call__(self, z):
+        x = hk.Linear(self._hidden_dim)(z)
+        x = jax.nn.softplus(x)
+        x = hk.Linear(self._out_dim)(x)
+        return jax.nn.sigmoid(x)
 
 
-def decoder(hidden_dim, out_dim):
-    return stax.serial(
-        stax.Dense(hidden_dim, W_init=stax.randn()), stax.Softplus,
-        stax.Dense(out_dim, W_init=stax.randn()), stax.Sigmoid,
-    )
+def numpyro_haiku(name, haiku_fn, input_shape):
+    """Converts a Haiku module to a Stax module and calls numpyro.module."""
+    init_fn, apply_fn = hk.transform(haiku_fn, apply_rng=True)
+    def stax_init_fn(rng, in_shapes):
+        # TODO: Extend to trees of in_shapes.
+        inputs = np.zeros(in_shapes)
+        params = init_fn(rng, inputs)
+        output = apply_fn(params, None, inputs)
+        out_shapes = jax.tree_map(lambda o: o.shape, output)
+        return out_shapes, params
+    def stax_apply_fn(params, inputs):
+        return apply_fn(params, None, inputs)
+    return numpyro.module(name, (stax_init_fn, stax_apply_fn), input_shape)
 
 
 def model(batch, hidden_dim=400, z_dim=100):
     batch = np.reshape(batch, (batch.shape[0], -1))
     batch_dim, out_dim = np.shape(batch)
-    decode = numpyro.module('decoder', decoder(hidden_dim, out_dim), (batch_dim, z_dim))
+    decode = numpyro_haiku(
+            'decoder',
+            lambda x: Decoder(hidden_dim, out_dim)(x),
+            (batch_dim, z_dim))
     z = numpyro.sample('z', dist.Normal(np.zeros((z_dim,)), np.ones((z_dim,))))
     img_loc = decode(z)
     return numpyro.sample('obs', dist.Bernoulli(img_loc), obs=batch)
@@ -57,7 +89,10 @@ def model(batch, hidden_dim=400, z_dim=100):
 def guide(batch, hidden_dim=400, z_dim=100):
     batch = np.reshape(batch, (batch.shape[0], -1))
     batch_dim, out_dim = np.shape(batch)
-    encode = numpyro.module('encoder', encoder(hidden_dim, z_dim), (batch_dim, out_dim))
+    encode = numpyro_haiku(
+            'encoder',
+            lambda x: Encoder(hidden_dim, z_dim)(x),
+            (batch_dim, out_dim))
     z_loc, z_std = encode(batch)
     z = numpyro.sample('z', dist.Normal(z_loc, z_std))
     return z
@@ -69,8 +104,10 @@ def binarize(rng_key, batch):
 
 
 def main(args):
-    encoder_nn = encoder(args.hidden_dim, args.z_dim)
-    decoder_nn = decoder(args.hidden_dim, 28 * 28)
+    encoder_nn = hk.transform(
+            lambda x: Encoder(args.hidden_dim, args.z_dim)(x))
+    decoder_nn = hk.transform(
+            lambda z: Decoder(args.hidden_dim, 28 * 28)(z))
     adam = optim.Adam(args.learning_rate)
     svi = SVI(model, guide, adam, ELBO(), hidden_dim=args.hidden_dim, z_dim=args.z_dim)
     rng_key = PRNGKey(0)
